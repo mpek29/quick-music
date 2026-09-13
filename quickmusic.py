@@ -443,6 +443,21 @@ def adb_state(adb: str) -> str:
     return "unplugged"
 
 
+def scan(adb: str, remote_file: str) -> None:
+    """Ask Android to index one file, instead of waiting for it to notice by itself.
+
+    It has to be one file at a time: the same broadcast aimed at the folder is
+    accepted and then silently ignored. The path is percent-encoded, which also
+    keeps spaces and quotes in track names out of the device shell's way.
+    """
+    uri = "file://" + urllib.parse.quote(remote_file)
+    subprocess.run(
+        [adb, "shell", "am", "broadcast", "-a",
+         "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", uri],
+        capture_output=True,
+    )
+
+
 def push(adb: str, folder: str, jobs: int) -> tuple:
     album = os.path.basename(folder)
     remote = f"/sdcard/Music/{album}"
@@ -459,6 +474,11 @@ def push(adb: str, folder: str, jobs: int) -> tuple:
 
     def send(name: str, task) -> bool:
         if name in already:
+            # Still worth a scan: the file can be on the phone yet missing from the
+            # music app, which is what re-running push is for.
+            view.start(task)
+            view.update(task, note="indexing")
+            scan(adb, f"{remote}/{name}")
             view.done(task, total=1, completed=1, note="already there")
             return True
         view.start(task)
@@ -469,6 +489,8 @@ def push(adb: str, folder: str, jobs: int) -> tuple:
             [adb, "push", os.path.join(folder, name), remote], capture_output=True, text=True
         )
         if r.returncode == 0:
+            view.update(task, note="indexing")
+            scan(adb, f"{remote}/{name}")
             view.done(task, total=1, completed=1, note="sent")
             return True
         why = ((r.stderr or r.stdout).strip().splitlines() or ["adb push failed"])[-1]
@@ -482,12 +504,6 @@ def push(adb: str, folder: str, jobs: int) -> tuple:
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
             sent = sum(pool.map(lambda p: send(*p), zip(files, tasks)))
 
-    # Ask Android to index the new files now, instead of waiting for a reboot.
-    subprocess.run(
-        [adb, "shell", "am", "broadcast", "-a",
-         "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", f"file://{remote}"],
-        capture_output=True,
-    )
     return sent, failed
 
 

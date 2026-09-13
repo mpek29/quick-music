@@ -166,9 +166,15 @@ what most phone storage still uses.
 
 `push` uses `adb push`, which works identically on Windows, Linux and macOS and
 needs no vendor software. Files already on the phone are skipped, so an
-interrupted transfer is resumed simply by running the command again. A
-`MEDIA_SCANNER_SCAN_FILE` broadcast at the end tells Android to index the album
-immediately instead of waiting for the next reboot.
+interrupted transfer is resumed simply by running the command again.
+
+Each file then gets its own `MEDIA_SCANNER_SCAN_FILE` broadcast, so the album
+turns up in the music app right away instead of whenever Android next happens
+to scan. It has to be one broadcast per file — the same intent aimed at the
+folder is accepted and then quietly ignored, which looks like it worked and
+leaves the album invisible. Files already on the phone are re-announced too,
+so running `push` again is also the fix for an album that is on the phone but
+missing from the music app.
 
 ## Project structure
 
@@ -192,7 +198,7 @@ readable in a single sitting.
 | `age-restricted` on some tracks | Re-run with `--cookies firefox` (or `chrome`, `edge`) while logged into YouTube in that browser. |
 | Tracks skipped for low confidence | The YouTube match looked wrong. Inspect the list it prints, then lower `--min-confidence` if you disagree. |
 | `Phone detected but not authorised` | Unlock the phone and accept the USB debugging prompt. |
-| Album not showing in the music app | Reboot the phone to force a full media rescan. |
+| Album not showing in the music app | Run `push` again — it re-announces every file to the media scanner. |
 | yt-dlp suddenly breaks | YouTube changed something. `pip install -U yt-dlp` fixes it nine times out of ten. |
 
 ## Legal
