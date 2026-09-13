@@ -51,6 +51,14 @@ python quickmusic.py get "https://open.spotify.com/playlist/37i9dQZF1DX4o1oenSJR
 python quickmusic.py push
 ```
 
+Both phases show a counter and a bar per track: the YouTube match with its
+confidence score, then the download with size, speed and ETA. `--jobs` rows
+advance at a time, finished ones drop off the list to make room, and anything
+that went wrong stays on screen in red.
+
+A playlist longer than 100 tracks is cut at 100 — that is all Spotify's embed
+page ever hands back, and `get` says so when it happens.
+
 `get` leaves you with a ready album folder:
 
 ```
@@ -66,7 +74,9 @@ whole — so your library never shows up in `git status`, whatever the playlists
 are called.
 
 `push` sends the most recent album folder to `/sdcard/Music/` on the phone, then
-asks Android to rescan, so it shows up in your music app right away.
+asks Android to rescan, so it shows up in your music app right away. It uses the
+same live view, and tracks already on the phone are skipped rather than resent —
+so an interrupted transfer is resumed by simply running it again.
 
 ## Requirements
 
@@ -97,13 +107,13 @@ on the phone, plug it in, and accept the prompt asking to trust this computer.
 
 ```bash
 python quickmusic.py get <playlist-url> [-q 320] [-j 4] [--min-confidence 80] [--cookies firefox]
-python quickmusic.py push [folder]
+python quickmusic.py push [folder] [-j 4]
 ```
 
 | Flag | Default | What it changes |
 |------|---------|-----------------|
 | `-q`, `--quality` | `256` | MP3 bitrate: 128, 192, 256 or 320 kbps |
-| `-j`, `--jobs` | `3` | Downloads running in parallel |
+| `-j`, `--jobs` | `3` | Searches, downloads and phone transfers running in parallel |
 | `--min-confidence` | `90` | How sure the YouTube match must be to be kept |
 | `--cookies BROWSER` | off | Borrow browser cookies to reach age-restricted videos |
 | `--out DIR` | `music` | Where album folders are created and looked for |
@@ -165,12 +175,12 @@ immediately instead of waiting for the next reboot.
 ```
 quick-music/
 ├── quickmusic.py      # the whole thing: get + push
-├── requirements.txt   # yt-dlp, mutagen
+├── requirements.txt   # yt-dlp, mutagen, rich
 ├── README.md
 └── music/             # git-ignored, one folder per playlist
 ```
 
-One file, around 400 lines, no framework. Everything it does is meant to be
+One file, around 600 lines, no framework. Everything it does is meant to be
 readable in a single sitting.
 
 ## Troubleshooting

@@ -35,6 +35,7 @@ NOISE = ("live", "cover", "reaction", "lyrics", "sped up", "slowed", "8d", "nigh
 ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 CACHE = ".search-cache.json"
+EMBED_CAP = 100  # the embed page hands back at most this many tracks, whatever the playlist
 _print_lock = threading.Lock()
 
 
@@ -46,6 +47,83 @@ def say(msg: str) -> None:
 def safe(name: str, maxlen: int = 60) -> str:
     name = ILLEGAL.sub("", name).strip().rstrip(".")
     return re.sub(r"\s+", " ", name)[:maxlen].strip() or "untitled"
+
+
+# --------------------------------------------------------------------------
+# The live view - the whole tracklist on screen, one bar per track
+# --------------------------------------------------------------------------
+
+LABEL = 44  # fixed, so every bar starts in the same column
+
+
+def plain(text: str) -> str:
+    return text.replace("[", "(").replace("]", ")")  # rich reads [...] as markup
+
+
+def fit(text: str, width: int = LABEL) -> str:
+    text = plain(text)
+    return text[: width - 1] + "…" if len(text) > width else text.ljust(width)
+
+
+class View:
+    """A counter on top, then one row per track underneath.
+
+    A finished row is dropped from the list, so the window keeps showing the
+    tracks still working rather than a wall of completed ones. Rows that need
+    attention - a weak match, a failed download - stay put in red.
+    """
+
+    def __init__(self, title: str, count: int, downloading: bool):
+        from rich.console import Group
+        from rich.live import Live
+        from rich.progress import (
+            BarColumn,
+            DownloadColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+            TransferSpeedColumn,
+        )
+
+        tail = (
+            [DownloadColumn(), TransferSpeedColumn(), TimeRemainingColumn()]
+            if downloading
+            else [TextColumn("{task.fields[note]}")]
+        )
+        self.rows = Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), *tail)
+        self.head = Progress(
+            TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn()
+        )
+        self.counter = self.head.add_task(title, total=count)
+        # Crop rather than fight the scrollback if the survivors still overflow.
+        self.live = Live(Group(self.head, self.rows), refresh_per_second=10,
+                         vertical_overflow="ellipsis")
+
+    def __enter__(self) -> "View":
+        self.live.__enter__()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.live.__exit__(*exc)
+
+    def add(self, label: str, **fields):
+        return self.rows.add_task(label, start=False, total=None, **fields)
+
+    def start(self, task) -> None:
+        self.rows.start_task(task)
+
+    def update(self, task, **kw) -> None:
+        self.rows.update(task, **kw)
+
+    def done(self, task, ok: bool = True, **kw) -> None:
+        """Retire a row: count it and drop it, or leave it on screen if it went wrong."""
+        self.rows.update(task, **kw)
+        if ok:
+            self.head.advance(self.counter)
+            self.rows.update(task, visible=False)
 
 
 # --------------------------------------------------------------------------
@@ -171,7 +249,27 @@ def score(cand: dict, title: str, artist: str, want: int | None) -> float:
     return s
 
 
-def resolve(playlist: dict, cache_path: str) -> None:
+def candidates(track: dict, note) -> list:
+    """Search YouTube for one track, degrading the query until something comes back."""
+    first = re.split(r"[,&]", track["artist"] or "")[0].strip()
+    bare = re.sub(r"[(\[].*", "", track["title"] or "").strip()
+    queries = list(dict.fromkeys(
+        [f"{track['artist']} {track['title']}", f"{track['title']} {first}",
+         f"{first} {bare}", track["title"]]
+    ))
+    for i, q in enumerate(queries):
+        note(f"searching {i + 1}/{len(queries)}")
+        try:
+            if found := search(q)[:12]:
+                return found
+        except Exception as exc:
+            note(str(exc).split("\n")[0][:30])
+        if i + 1 < len(queries):  # back off only before trying another wording
+            time.sleep(0.8)
+    return []
+
+
+def resolve(playlist: dict, cache_path: str, jobs: int, floor: int) -> None:
     """Attach the best YouTube match and a confidence score to every track."""
     cache = {}
     if os.path.exists(cache_path):
@@ -180,30 +278,39 @@ def resolve(playlist: dict, cache_path: str) -> None:
         except ValueError:
             pass
 
-    total = len(playlist["tracks"])
-    for t in playlist["tracks"]:
+    tracks = playlist["tracks"]
+    lock = threading.Lock()
+
+    def match(t: dict, task) -> None:
         key = f"{t['artist']} {t['title']}"
+        view.start(task)
         if key not in cache:
-            first = re.split(r"[,&]", t["artist"] or "")[0].strip()
-            bare = re.sub(r"[(\[].*", "", t["title"] or "").strip()
-            found = []
-            # YouTube sometimes returns nothing for the exact query; degrade gradually.
-            for q in dict.fromkeys([key, f"{t['title']} {first}", f"{first} {bare}", t["title"]]):
-                try:
-                    found = search(q)[:12]
-                except Exception as exc:
-                    say(f"  ! search failed for {t['title']}: {exc}")
-                time.sleep(0.8)
-                if found:
-                    break
-            cache[key] = found
-            json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False)
+            found = candidates(t, lambda msg: view.update(task, note=plain(msg)))
+            with lock:
+                cache[key] = found
+                # Written after every track so an interrupted run keeps its searches.
+                json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False)
+        else:
+            view.update(task, note="cached")
 
         ranked = sorted(cache[key], key=lambda c: score(c, t["title"], t["artist"], t["seconds"]), reverse=True)
         best = ranked[0] if ranked else None
         t["url"] = f"https://www.youtube.com/watch?v={best['id']}" if best else None
         t["confidence"] = round(score(best, t["title"], t["artist"], t["seconds"])) if best else 0
-        say(f"  [{t['n']:3}/{total}] {t['confidence']:3}  {t['artist']} - {t['title']}")
+        # A match below the bar keeps its row; completed == total is what stops its spinner.
+        weak = t["confidence"] < floor
+        view.done(
+            task,
+            ok=not weak,
+            total=1,
+            completed=1,
+            note=f"[red]{t['confidence']} too low[/red]" if weak else f"[green]{t['confidence']}[/green]",
+        )
+
+    with View(f"Matching {len(tracks)} tracks on YouTube", len(tracks), downloading=False) as view:
+        tasks = [view.add(fit(f"{t['artist']} - {t['title']}"), note="queued") for t in tracks]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            list(pool.map(lambda p: match(*p), zip(tracks, tasks)))
 
 
 # --------------------------------------------------------------------------
@@ -221,15 +328,27 @@ def js_runtimes() -> dict:
     return {name: {} for name in ("deno", "node", "bun") if shutil.which(name)}
 
 
-def download_one(track: dict, dest: str, total: int, quality: int, cookies: str | None) -> str | None:
+def download_one(track: dict, dest: str, total: int, quality: int, cookies: str | None,
+                 view, task) -> str | None:
     import yt_dlp
 
+    label = fit(f"{track['artist']} - {track['title']}")
     stem = "%02d - %s - %s" % (track["i"], safe(track["artist"], 40), safe(track["title"]))
     target = os.path.join(dest, stem + ".mp3")
     if os.path.exists(target):
-        say(f"  = {stem}")
+        view.done(task)
         return target
 
+    def hook(d: dict) -> None:
+        if d["status"] == "downloading":
+            size = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if size:  # a stream with no announced length keeps its bar pulsing
+                view.update(task, total=size, completed=d.get("downloaded_bytes") or 0)
+        elif d["status"] == "finished":
+            view.update(task, completed=d.get("total_bytes"),
+                        description=f"[cyan]{label}[/cyan]")
+
+    view.start(task)
     opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(dest, stem + ".%(ext)s"),
@@ -237,9 +356,10 @@ def download_one(track: dict, dest: str, total: int, quality: int, cookies: str 
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(quality)}
         ],
         "js_runtimes": js_runtimes(),
+        "progress_hooks": [hook],
         "quiet": True,
         "no_warnings": True,
-        "noprogress": True,
+        "noprogress": True,  # yt-dlp's own bar would fight ours for the same lines
     }
     if ff := find_ffmpeg():
         opts["ffmpeg_location"] = ff
@@ -252,12 +372,16 @@ def download_one(track: dict, dest: str, total: int, quality: int, cookies: str 
     except Exception as exc:
         msg = str(exc).split("\n")[0]
         if "confirm your age" in msg:
-            msg = "age-restricted (retry with --cookies firefox)"
-        say(f"  x {stem}  ->  {msg}")
+            msg = "age-restricted, retry with --cookies firefox"
+        # Keep the track name on the row - the reason goes in the summary below the list.
+        # The row stays on screen; total == completed stops its spinner, zero keeps
+        # the byte count honest, and the reason goes in the summary below the list.
+        track["error"] = msg
+        view.done(task, ok=False, description=f"[red]{label}[/red]", total=0, completed=0)
         return None
 
     tag(target, track, total)
-    say(f"  + {stem}")
+    view.done(task)
     return target
 
 
@@ -319,7 +443,7 @@ def adb_state(adb: str) -> str:
     return "unplugged"
 
 
-def push(adb: str, folder: str) -> int:
+def push(adb: str, folder: str, jobs: int) -> tuple:
     album = os.path.basename(folder)
     remote = f"/sdcard/Music/{album}"
     subprocess.run([adb, "shell", "mkdir", "-p", f"'{remote}'"], capture_output=True)
@@ -330,20 +454,33 @@ def push(adb: str, folder: str) -> int:
     already = {line.strip() for line in have}
 
     files = sorted(f for f in os.listdir(folder) if f.lower().endswith(".mp3"))
-    sent = 0
-    for i, f in enumerate(files, 1):
-        if f in already:
-            sent += 1
-            say(f"  [{i}/{len(files)}] = {f}")
-            continue
+    failed = []
+    lock = threading.Lock()
+
+    def send(name: str, task) -> bool:
+        if name in already:
+            view.done(task, total=1, completed=1, note="already there")
+            return True
+        view.start(task)
+        view.update(task, note="sending")
+        # adb only prints its own percentages to a terminal, so the row pulses
+        # instead: the counter above is what tracks the album going across.
         r = subprocess.run(
-            [adb, "push", os.path.join(folder, f), remote], capture_output=True, text=True
+            [adb, "push", os.path.join(folder, name), remote], capture_output=True, text=True
         )
         if r.returncode == 0:
-            sent += 1
-            say(f"  [{i}/{len(files)}] {f}")
-        else:
-            say(f"  [{i}/{len(files)}] x {f}  ->  {r.stderr.strip()[:120]}")
+            view.done(task, total=1, completed=1, note="sent")
+            return True
+        why = ((r.stderr or r.stdout).strip().splitlines() or ["adb push failed"])[-1]
+        with lock:
+            failed.append((name, why))
+        view.done(task, ok=False, total=1, completed=1, note=f"[red]{plain(why)[:30]}[/red]")
+        return False
+
+    with View(f"Sending {len(files)} tracks to Music/{album}", len(files), downloading=False) as view:
+        tasks = [view.add(fit(f), note="queued") for f in files]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            sent = sum(pool.map(lambda p: send(*p), zip(files, tasks)))
 
     # Ask Android to index the new files now, instead of waiting for a reboot.
     subprocess.run(
@@ -351,7 +488,7 @@ def push(adb: str, folder: str) -> int:
          "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", f"file://{remote}"],
         capture_output=True,
     )
-    return sent
+    return sent, failed
 
 
 # --------------------------------------------------------------------------
@@ -372,6 +509,7 @@ def albums(root: str) -> list:
 
 def cmd_get(args: argparse.Namespace) -> int:
     try:
+        import rich  # noqa: F401
         import yt_dlp  # noqa: F401
     except ImportError:
         raise SystemExit("Missing dependency. Run: pip install -r requirements.txt")
@@ -385,27 +523,39 @@ def cmd_get(args: argparse.Namespace) -> int:
 
     say("Reading the Spotify playlist...")
     pl = fetch_playlist(args.url)
-    say(f"  {pl['name']} - {pl['owner']} ({len(pl['tracks'])} tracks)\n")
+    say(f"  {pl['name']} - {pl['owner']} ({len(pl['tracks'])} tracks)")
+    if len(pl["tracks"]) == EMBED_CAP:
+        say(f"  ! The embed page never returns more than {EMBED_CAP} tracks, so a longer "
+            "playlist is cut here.")
+    say("")
 
     dest = os.path.join(args.out, safe(pl["name"], 70))
     os.makedirs(dest, exist_ok=True)
 
-    say("Matching each track on YouTube...")
-    resolve(pl, os.path.join(dest, CACHE))
+    resolve(pl, os.path.join(dest, CACHE), args.jobs, args.min_confidence)
 
     chosen = [t for t in pl["tracks"] if t["url"] and t["confidence"] >= args.min_confidence]
     skipped = [t for t in pl["tracks"] if t not in chosen]
     for i, t in enumerate(chosen, 1):
         t.update(i=i, album=pl["name"], albumartist=pl["owner"])
 
-    say(f"\nDownloading {len(chosen)} tracks at {args.quality} kbps into {dest}")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        done = list(pool.map(
-            lambda t: download_one(t, dest, len(chosen), args.quality, args.cookies), chosen
-        ))
+    say("")
+    with View(f"Downloading at {args.quality} kbps into {dest}", len(chosen),
+              downloading=True) as view:
+        tasks = [view.add(fit(f"{t['artist']} - {t['title']}")) for t in chosen]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            done = list(pool.map(
+                lambda p: download_one(p[0], dest, len(chosen), args.quality, args.cookies,
+                                       view, p[1]),
+                zip(chosen, tasks),
+            ))
     got = [p for p in done if p]
 
     say(f"\n{len(got)}/{len(chosen)} tracks in {dest}")
+    if failed := [t for t in chosen if t.get("error")]:
+        say("\nFailed to download:")
+        for t in failed:
+            say(f"  {t['n']:3}. {t['artist']} - {t['title']}  ->  {t['error']}")
     if skipped:
         say(f"\nSkipped, no confident match (confidence < {args.min_confidence}):")
         for t in skipped:
@@ -416,6 +566,10 @@ def cmd_get(args: argparse.Namespace) -> int:
 
 
 def cmd_push(args: argparse.Namespace) -> int:
+    try:
+        import rich  # noqa: F401
+    except ImportError:
+        raise SystemExit("Missing dependency. Run: pip install -r requirements.txt")
     folder = args.folder
     if not folder:
         found = albums(args.out)
@@ -441,10 +595,13 @@ def cmd_push(args: argparse.Namespace) -> int:
             "Settings > Developer options > USB debugging."
         )
 
-    say(f"Sending {len(files)} tracks from {os.path.basename(folder)}")
-    sent = push(adb, folder)
+    sent, failed = push(adb, folder, args.jobs)
 
     say(f"\n{sent}/{len(files)} tracks in Music/{os.path.basename(folder)} on the phone.")
+    if failed:
+        say("\nFailed to send:")
+        for name, why in failed:
+            say(f"  {name}  ->  {why[:100]}")
     if sent < len(files):
         say("Run it again to resend what is missing; files already there are skipped.")
         return 1
@@ -460,7 +617,8 @@ def main() -> int:
     g = sub.add_parser("get", help="Spotify playlist -> tagged MP3s")
     g.add_argument("url", help="public Spotify playlist URL or id")
     g.add_argument("-q", "--quality", type=int, choices=[128, 192, 256, 320], default=256)
-    g.add_argument("-j", "--jobs", type=int, default=3, help="parallel downloads (default: 3)")
+    g.add_argument("-j", "--jobs", type=int, default=3,
+                   help="parallel searches and downloads (default: 3)")
     g.add_argument("--min-confidence", type=int, default=90,
                    help="drop weaker YouTube matches (default: 90)")
     g.add_argument("--cookies", metavar="BROWSER",
@@ -469,6 +627,8 @@ def main() -> int:
 
     s = sub.add_parser("push", help="send an album folder to an Android phone")
     s.add_argument("folder", nargs="?", help="album folder (default: the most recent one)")
+    s.add_argument("-j", "--jobs", type=int, default=3,
+                   help="parallel transfers (default: 3)")
     s.set_defaults(func=cmd_push)
 
     args = p.parse_args()
