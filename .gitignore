@@ -4,6 +4,5 @@ __pycache__/
 # local ffmpeg binary, if you keep one next to the script
 ffmpeg/
 
-# downloaded albums and their search cache
-*.mp3
-.search-cache.json
+# every downloaded album lands here, one folder per playlist
+music/

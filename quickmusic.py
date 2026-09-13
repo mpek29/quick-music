@@ -360,6 +360,8 @@ def push(adb: str, folder: str) -> int:
 
 
 def albums(root: str) -> list:
+    if not os.path.isdir(root):
+        return []
     return sorted(
         (os.path.join(root, d) for d in os.listdir(root)
          if os.path.isdir(os.path.join(root, d))
@@ -451,7 +453,8 @@ def cmd_push(args: argparse.Namespace) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="quickmusic", description=__doc__.splitlines()[0])
-    p.add_argument("--out", default=".", help="where album folders live (default: here)")
+    p.add_argument("--out", default="music",
+                   help="where album folders live, one per playlist (default: music/)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("get", help="Spotify playlist -> tagged MP3s")

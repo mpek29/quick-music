@@ -54,11 +54,16 @@ python quickmusic.py push
 `get` leaves you with a ready album folder:
 
 ```
-All Out 2000s/
-├── 01 - Britney Spears - Oops!...I Did It Again.mp3
-├── 02 - Madonna - Hung Up.mp3
-└── ...
+music/
+└── All Out 2000s/
+    ├── 01 - Britney Spears - Oops!...I Did It Again.mp3
+    ├── 02 - Madonna - Hung Up.mp3
+    └── ...
 ```
+
+Every playlist gets its own folder under `music/`, which is git-ignored as a
+whole — so your library never shows up in `git status`, whatever the playlists
+are called.
 
 `push` sends the most recent album folder to `/sdcard/Music/` on the phone, then
 asks Android to rescan, so it shows up in your music app right away.
@@ -101,7 +106,7 @@ python quickmusic.py push [folder]
 | `-j`, `--jobs` | `3` | Downloads running in parallel |
 | `--min-confidence` | `90` | How sure the YouTube match must be to be kept |
 | `--cookies BROWSER` | off | Borrow browser cookies to reach age-restricted videos |
-| `--out DIR` | `.` | Where album folders are created and looked for |
+| `--out DIR` | `music` | Where album folders are created and looked for |
 
 ## How it works
 
@@ -161,7 +166,8 @@ immediately instead of waiting for the next reboot.
 quick-music/
 ├── quickmusic.py      # the whole thing: get + push
 ├── requirements.txt   # yt-dlp, mutagen
-└── README.md
+├── README.md
+└── music/             # git-ignored, one folder per playlist
 ```
 
 One file, around 400 lines, no framework. Everything it does is meant to be
